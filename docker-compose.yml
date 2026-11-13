@@ -1,0 +1,130 @@
+services:
+  # =============================================================================
+  # HẠ TẦNG: MESSAGE BROKER (RabbitMQ)
+  # =============================================================================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: clinic-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"     # AMQP protocol
+      - "15672:15672"   # RabbitMQ Management Web UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - clinic-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # HẠ TẦNG: CƠ SỞ DỮ LIỆU (PostgreSQL)
+  # Sẵn sàng cho Phase 2 (Tích hợp Database)
+  # =============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: clinic-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ClinicDb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - clinic-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ClinicDb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # DỊCH VỤ 1: Appointment.Api (ASP.NET Core Minimal API)
+  # =============================================================================
+  appointment-api:
+    build:
+      context: .
+      dockerfile: src/Appointment.Api/Dockerfile
+    container_name: clinic-appointment-api
+    restart: unless-stopped
+    ports:
+      - "5001:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=ClinicDb;Username=postgres;Password=postgrespassword"
+      RabbitMQ__HostName: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: "guest"
+      RabbitMQ__Password: "guest"
+      ServiceUrls__NotificationService: "http://notification-service:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - clinic-network
+
+  # =============================================================================
+  # DỊCH VỤ 2: Queue.Worker (.NET Worker Service)
+  # =============================================================================
+  queue-worker:
+    build:
+      context: .
+      dockerfile: src/Queue.Worker/Dockerfile
+    container_name: clinic-queue-worker
+    restart: unless-stopped
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=ClinicDb;Username=postgres;Password=postgrespassword"
+      RabbitMQ__HostName: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: "guest"
+      RabbitMQ__Password: "guest"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - clinic-network
+
+  # =============================================================================
+  # DỊCH VỤ 3: Notification.Service (Minimal API + SignalR)
+  # =============================================================================
+  notification-service:
+    build:
+      context: .
+      dockerfile: src/Notification.Service/Dockerfile
+    container_name: clinic-notification-service
+    restart: unless-stopped
+    ports:
+      - "5003:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMQ__HostName: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__UserName: "guest"
+      RabbitMQ__Password: "guest"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - clinic-network
+
+networks:
+  clinic-network:
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+  postgres_data:
+
