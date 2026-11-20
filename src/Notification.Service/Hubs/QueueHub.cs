@@ -16,36 +16,24 @@ public class QueueHub : Hub
 
     public override async Task OnConnectedAsync()
     {
-        _logger.LogInformation("[QueueHub] Client connected: {ConnectionId}", Context.ConnectionId);
+        _logger.LogInformation("[QueueHub] Client kết nối thành công: ConnectionId = {ConnectionId}", Context.ConnectionId);
         await base.OnConnectedAsync();
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        _logger.LogInformation("[QueueHub] Client disconnected: {ConnectionId}", Context.ConnectionId);
+        _logger.LogInformation("[QueueHub] Client ngắt kết nối: ConnectionId = {ConnectionId}", Context.ConnectionId);
         await base.OnDisconnectedAsync(exception);
     }
-
-    // =============================================================================
-    // TODO: Phase 4 - SignalR Real-time Integration
-    // Ở các buổi học tới về SignalR, chúng ta sẽ mở rộng các phương thức:
-    // 1. JoinDoctorQueue(doctorId): Client tham gia vào nhóm theo dõi hàng đợi của bác sĩ cụ thể.
-    // 2. LeaveDoctorQueue(doctorId): Client rời khỏi nhóm.
-    // 3. JoinPatientGroup(patientId): Client bệnh nhân nhận thông báo riêng tư khi đến lượt khám.
-    //
-    // Hub sẽ được gọi từ RabbitMQ Consumer (hoặc IHubContext<QueueHub>) để broadcast:
-    // - "ReceiveQueueUpdate": Gửi cập nhật hàng đợi mới nhất cho toàn bộ client trong phòng chờ.
-    // - "ReceiveTicketGenerated": Báo cho bệnh nhân biết số thứ tự của họ đã được cấp.
-    // - "CallPatient": Gọi số thứ tự tiếp theo vào phòng khám.
-    // =============================================================================
 
     /// <summary>
     /// Tham gia phòng theo dõi hàng đợi của bác sĩ.
     /// </summary>
     public async Task JoinDoctorQueue(string doctorId)
     {
-        _logger.LogInformation("[QueueHub] Client {ConnectionId} joining doctor queue group: {DoctorId}", Context.ConnectionId, doctorId);
-        await Groups.AddToGroupAsync(Context.ConnectionId, $"DoctorQueue_{doctorId}");
+        var groupName = $"DoctorQueue_{doctorId}";
+        _logger.LogInformation("[QueueHub] Client {ConnectionId} tham gia nhóm bác sĩ: {GroupName}", Context.ConnectionId, groupName);
+        await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
     }
 
     /// <summary>
@@ -53,8 +41,28 @@ public class QueueHub : Hub
     /// </summary>
     public async Task LeaveDoctorQueue(string doctorId)
     {
-        _logger.LogInformation("[QueueHub] Client {ConnectionId} leaving doctor queue group: {DoctorId}", Context.ConnectionId, doctorId);
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"DoctorQueue_{doctorId}");
+        var groupName = $"DoctorQueue_{doctorId}";
+        _logger.LogInformation("[QueueHub] Client {ConnectionId} rời nhóm bác sĩ: {GroupName}", Context.ConnectionId, groupName);
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);
+    }
+
+    /// <summary>
+    /// Tham gia nhóm theo dõi riêng cho một lịch hẹn (Định tuyến & Cách ly - Yêu cầu 3).
+    /// </summary>
+    public async Task JoinAppointmentGroup(string appointmentId)
+    {
+        var groupName = $"Appointment_{appointmentId}";
+        _logger.LogInformation("[QueueHub] Client {ConnectionId} tham gia nhóm lịch hẹn: {GroupName}", Context.ConnectionId, groupName);
+        await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
+    }
+
+    /// <summary>
+    /// Rời nhóm theo dõi riêng của lịch hẹn.
+    /// </summary>
+    public async Task LeaveAppointmentGroup(string appointmentId)
+    {
+        var groupName = $"Appointment_{appointmentId}";
+        _logger.LogInformation("[QueueHub] Client {ConnectionId} rời nhóm lịch hẹn: {GroupName}", Context.ConnectionId, groupName);
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);
     }
 }
-

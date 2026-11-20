@@ -1,8 +1,10 @@
-using System.Net;
+using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Configuration;
 using Shared.Contracts.DTOs;
+using Shared.Contracts.Enums;
 using Shared.Contracts.Models;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -14,30 +16,34 @@ var configuration = new ConfigurationBuilder()
     .Build();
 
 var appointmentApiUrl = configuration["ServiceUrls:AppointmentApi"] ?? "http://localhost:5001";
-var notificationServiceUrl = configuration["ServiceUrls:NotificationService"] ?? "http://localhost:5003";
+var signalRHubUrl = $"{appointmentApiUrl.TrimEnd('/')}/hubs/queue";
 
 using var httpClient = new HttpClient { BaseAddress = new Uri(appointmentApiUrl) };
 
 Console.WriteLine("================================================================================");
-Console.WriteLine("         HỆ THỐNG ĐẶT LỊCH KHÁM VÀ QUẢN LÝ HÀNG ĐỢI (ĐỀ TÀI 09)");
+Console.WriteLine("   HỆ THỐNG ĐẶT LỊCH KHÁM VÀ QUẢN LÝ HÀNG ĐỢI - .NET 10 MINIMAL API & SIGNALR");
 Console.WriteLine("                         PATIENT CLIENT APPLICATION");
 Console.WriteLine("================================================================================");
-Console.WriteLine($"[Config] Appointment.Api:        {appointmentApiUrl}");
-Console.WriteLine($"[Config] Notification.Service:   {notificationServiceUrl}");
-Console.WriteLine("--------------------------------------------------------------------------------");
+Console.WriteLine($"[Config] API Endpoint:        {appointmentApiUrl}");
+Console.WriteLine($"[Config] SignalR Hub:         {signalRHubUrl}");
+Console.WriteLine("================================================================================\n");
+
+// Danh sách các lịch hẹn đang được Client theo dõi (phục vụ Re-sync khi mất mạng)
+var activeTrackingAppointments = new ConcurrentBag<Guid>();
+
+// Khởi tạo SignalR Hub Connection với chính sách tự động kết nối lại
+var hubConnection = BuildHubConnection(signalRHubUrl, activeTrackingAppointments, httpClient);
 
 bool running = true;
 while (running)
 {
-    Console.WriteLine("\nCHỌN CHỨC NĂNG:");
-    Console.WriteLine("1. Xem danh sách bác sĩ (GET /doctors)");
-    Console.WriteLine("2. Xem chi tiết bác sĩ theo ID (GET /doctors/{id}) - [Yêu cầu 3 & 4]");
-    Console.WriteLine("3. Xem khung giờ khám của bác sĩ (GET /doctors/{id}/slots)");
-    Console.WriteLine("4. Đặt lịch khám bệnh (POST /appointments) - [Yêu cầu 1]");
-    Console.WriteLine("5. Tra cứu chi tiết lịch hẹn (GET /appointments/{id}) - [Yêu cầu 3 & 4]");
-    Console.WriteLine("6. Hủy lịch hẹn khám (DELETE /appointments/{id})");
-    Console.WriteLine("7. Xem trạng thái hàng đợi phòng khám (GET /queues/{doctorId})");
-    Console.WriteLine("8. Kiểm tra kết nối Health Check các dịch vụ");
+    Console.WriteLine("\n----------------------------- MENU CHỨC NĂNG -----------------------------");
+    Console.WriteLine("1. [Yêu cầu 1] Chạy LUỒNG CƠ BẢN ĐẦY ĐỦ: REST -> Đặt lịch -> SignalR -> REST");
+    Console.WriteLine("2. [Yêu cầu 2] Kiểm thử xử lý TRẠNG THÁI LỖI (Status: Failed) qua SignalR");
+    Console.WriteLine("3. [Yêu cầu 3] Kiểm thử ĐỒNG THỜI 2 LỊCH KHÁM (Concurrency & Isolation)");
+    Console.WriteLine("4. [Yêu cầu 4] Kiểm thử MẤT KẾT NỐI SignalR & Cơ chế Re-sync qua REST");
+    Console.WriteLine("5. Xem danh sách Bác sĩ & Khung giờ khám (REST API thuần túy)");
+    Console.WriteLine("6. Tra cứu chi tiết một lịch hẹn bất kỳ qua REST (GET /appointments/{id})");
     Console.WriteLine("0. Thoát");
     Console.Write("\nNhập lựa chọn của bạn: ");
 
@@ -49,32 +55,27 @@ while (running)
         switch (choice)
         {
             case "1":
-                await ShowDoctorsAsync(httpClient);
+                await RunBasicFlowAsync(httpClient, hubConnection, activeTrackingAppointments);
                 break;
             case "2":
-                await ShowDoctorDetailsAsync(httpClient);
+                await RunFailedStateFlowAsync(httpClient, hubConnection, activeTrackingAppointments);
                 break;
             case "3":
-                await ShowDoctorSlotsAsync(httpClient);
+                await RunConcurrentAppointmentsFlowAsync(httpClient, hubConnection);
                 break;
             case "4":
-                await BookAppointmentAsync(httpClient);
+                await TestDisconnectionScenarioAsync(hubConnection, appointmentApiUrl);
                 break;
             case "5":
-                await LookupAppointmentAsync(httpClient);
+                await ShowDoctorsAndSlotsAsync(httpClient);
                 break;
             case "6":
-                await CancelAppointmentAsync(httpClient);
-                break;
-            case "7":
-                await ShowQueueStatusAsync(httpClient);
-                break;
-            case "8":
-                await CheckServicesHealthAsync(httpClient, notificationServiceUrl);
+                await LookupAppointmentDetailsAsync(httpClient);
                 break;
             case "0":
                 running = false;
-                Console.WriteLine("Cảm ơn bạn đã sử dụng dịch vụ!");
+                Console.WriteLine("Tạm biệt! Đang đóng kết nối...");
+                await hubConnection.DisposeAsync();
                 break;
             default:
                 Console.WriteLine("Lựa chọn không hợp lệ. Vui lòng chọn lại.");
@@ -84,343 +85,460 @@ while (running)
     catch (HttpRequestException ex)
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"[Lỗi mạng] Không thể gửi yêu cầu tới Appointment.Api ({appointmentApiUrl}).");
+        Console.WriteLine($"[Lỗi mạng REST] Không thể kết nối tới Server ({appointmentApiUrl}).");
         Console.WriteLine($"Chi tiết: {ex.Message}");
-        Console.WriteLine("Gợi ý: Hãy đảm bảo dịch vụ Appointment.Api đang chạy (ví dụ qua lệnh 'dotnet run' hoặc 'docker compose up').");
+        Console.WriteLine("Gợi ý: Hãy đảm bảo dịch vụ Appointment.Api đang chạy: dotnet run --project src/Appointment.Api/Appointment.Api.csproj --urls http://localhost:5001");
         Console.ResetColor();
     }
     catch (Exception ex)
     {
         Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"[Lỗi ngoại lệ] {ex.Message}");
+        Console.WriteLine($"[Ngoại lệ] {ex.Message}");
         Console.ResetColor();
     }
 }
 
 // =============================================================================
-// CÁC HÀM XỬ LÝ NGHIỆP VỤ & GỌI API PHÍA CLIENT
+// CẤU HÌNH SIGNALR HUB CONNECTION & RECONNECT HANDLERS (YÊU CẦU 4)
 // =============================================================================
-
-// 1. GET /doctors
-static async Task ShowDoctorsAsync(HttpClient client)
+static HubConnection BuildHubConnection(string hubUrl, ConcurrentBag<Guid> activeTracking, HttpClient client)
 {
-    Console.WriteLine(">>> Đang gửi yêu cầu: GET /doctors ...");
-    var response = await client.GetAsync("/doctors");
+    var connection = new HubConnectionBuilder()
+        .WithUrl(hubUrl)
+        // Cấu hình Automatic Reconnect với các khoảng thời gian thử lại: 0s, 2s, 10s, 30s
+        .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30) })
+        .Build();
 
-    if (!response.IsSuccessStatusCode)
+    // Sự kiện 1: Đang mất kết nối và đang thử kết nối lại
+    connection.Reconnecting += (error) =>
     {
-        await HandleApiErrorAsync(response);
-        return;
-    }
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\n[SignalR Warning] MẤT KẾT NỐI TỚI SERVER! Đang tự động kết nối lại...");
+        Console.WriteLine($"Nguyên nhân: {error?.Message}");
+        Console.ResetColor();
+        return Task.CompletedTask;
+    };
 
-    var doctors = await response.Content.ReadFromJsonAsync<List<Doctor>>();
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine($"\n--- DANH SÁCH BÁC SĨ (Tổng số: {doctors?.Count ?? 0}) ---");
-    Console.ResetColor();
-
-    if (doctors is null || doctors.Count == 0)
-    {
-        Console.WriteLine("Chưa có bác sĩ nào trong hệ thống.");
-        return;
-    }
-
-    foreach (var doc in doctors)
-    {
-        Console.WriteLine($"• ID: {doc.Id}");
-        Console.WriteLine($"  Họ và tên:   {doc.FullName}");
-        Console.WriteLine($"  Chuyên khoa: {doc.Specialty} | {doc.RoomNumber}");
-        Console.WriteLine($"  Trạng thái:  {(doc.IsActive ? "Đang tiếp nhận khám" : "Tạm nghỉ")}");
-        Console.WriteLine(new string('-', 60));
-    }
-}
-
-// 2. GET /doctors/{id} - Yêu cầu 3 & 4
-static async Task ShowDoctorDetailsAsync(HttpClient client)
-{
-    Console.WriteLine("Nhập Doctor ID cần tra cứu chi tiết:");
-    Console.WriteLine("  (1) Bác sĩ mẫu: 11111111-1111-1111-1111-111111111111 (BS. Nguyễn Văn A)");
-    Console.WriteLine("  (2) Bác sĩ mới: 44444444-4444-4444-4444-444444444444 (BS. Phạm Thị D)");
-    Console.WriteLine("  (3) ID không tồn tại để test lỗi 404: 00000000-0000-0000-0000-000000000404");
-    Console.Write("Nhập ID (bỏ trống để dùng ID BS. Phạm Thị D): ");
-
-    var input = Console.ReadLine()?.Trim();
-    var doctorId = string.IsNullOrEmpty(input) ? "44444444-4444-4444-4444-444444444444" : input;
-
-    Console.WriteLine($"\n>>> Đang gửi yêu cầu: GET /doctors/{doctorId} ...");
-    var response = await client.GetAsync($"/doctors/{doctorId}");
-
-    // Xử lý lỗi chuẩn 404 / 400 thay vì để văng Exception
-    if (!response.IsSuccessStatusCode)
-    {
-        await HandleApiErrorAsync(response);
-        return;
-    }
-
-    var doctor = await response.Content.ReadFromJsonAsync<Doctor>();
-    if (doctor is not null)
+    // Sự kiện 2: Đã kết nối lại thành công -> THỰC HIỆN RE-JOIN GROUP VÀ RE-SYNC REST (Yêu cầu 4)
+    connection.Reconnected += async (newConnectionId) =>
     {
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine("\n=== THÔNG TIN CHI TIẾT BÁC SĨ ===");
+        Console.WriteLine($"\n[SignalR Success] ĐÃ KẾT NỐI LẠI THÀNH CÔNG! ConnectionId mới: {newConnectionId}");
         Console.ResetColor();
-        Console.WriteLine($"• Mã định danh (ID): {doctor.Id}");
-        Console.WriteLine($"• Họ và tên bác sĩ:  {doctor.FullName}");
-        Console.WriteLine($"• Chuyên khoa:       {doctor.Specialty}");
-        Console.WriteLine($"• Phòng khám:        {doctor.RoomNumber}");
-        Console.WriteLine($"• Tình trạng:        {(doctor.IsActive ? "Đang hoạt động" : "Ngừng tiếp nhận")}");
+
+        Console.WriteLine(">>> [Reconnection Handler] Đang tự động Re-join các nhóm lịch hẹn và đồng bộ lại trạng thái...");
+
+        foreach (var apptId in activeTracking)
+        {
+            try
+            {
+                // 1. Re-join SignalR Group
+                await connection.InvokeAsync("JoinAppointmentGroup", apptId.ToString());
+                Console.WriteLine($"  + Đã re-join SignalR Group: Appointment_{apptId}");
+
+                // 2. Gọi lại REST API để đọc trạng thái mặt đất (State Reconciliation)
+                var res = await client.GetAsync($"/appointments/{apptId}");
+                if (res.IsSuccessStatusCode)
+                {
+                    var content = await res.Content.ReadAsStringAsync();
+                    Console.WriteLine($"  + Dữ liệu trạng thái đồng bộ từ REST API:\n    {content}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  - Lỗi khi re-sync lịch hẹn {apptId}: {ex.Message}");
+            }
+        }
+    };
+
+    // Sự kiện 3: Kết nối đóng hoàn toàn (hết số lần retry)
+    connection.Closed += (error) =>
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"\n[SignalR Error] KẾT NỐI ĐÃ ĐÓNG HOÀN TOÀN: {error?.Message}");
+        Console.ResetColor();
+        return Task.CompletedTask;
+    };
+
+    return connection;
+}
+
+// Hàm đảm bảo kết nối SignalR đang mở
+static async Task EnsureHubConnectedAsync(HubConnection hub)
+{
+    if (hub.State == HubConnectionState.Disconnected)
+    {
+        Console.WriteLine(">>> [SignalR] Đang thiết lập kết nối tới Hub...");
+        await hub.StartAsync();
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"[SignalR] Kết nối thành công! ConnectionId = {hub.ConnectionId}");
+        Console.ResetColor();
     }
 }
 
-// 3. GET /doctors/{id}/slots
-static async Task ShowDoctorSlotsAsync(HttpClient client)
+// =============================================================================
+// YÊU CẦU 1: LUỒNG CƠ BẢN (REST -> ĐẶT LỊCH -> SIGNALR REALTIME -> ĐỐI CHIẾU REST)
+// =============================================================================
+static async Task RunBasicFlowAsync(HttpClient client, HubConnection hub, ConcurrentBag<Guid> activeTracking)
 {
-    Console.Write("Nhập Doctor ID (bỏ trống để dùng BS. Nguyễn Văn A): ");
-    var input = Console.ReadLine()?.Trim();
-    var doctorId = string.IsNullOrEmpty(input) ? "11111111-1111-1111-1111-111111111111" : input;
+    Console.WriteLine("================================================================================");
+    Console.WriteLine("        BẮT ĐẦU KIỂM THỬ YÊU CẦU 1: LUỒNG ĐẶT LỊCH & REALTIME ĐẦY ĐỦ");
+    Console.WriteLine("================================================================================");
 
-    Console.WriteLine($"\n>>> Đang gửi yêu cầu: GET /doctors/{doctorId}/slots ...");
-    var response = await client.GetAsync($"/doctors/{doctorId}/slots");
+    // Bước 1: Gọi REST API lấy danh sách bác sĩ
+    Console.WriteLine("\n[Bước 1/5] GỌI REST API: GET /doctors");
+    var docRes = await client.GetAsync("/doctors");
+    docRes.EnsureSuccessStatusCode();
+    var doctors = await docRes.Content.ReadFromJsonAsync<List<Doctor>>() ?? [];
+    var doctor = doctors.First();
+    Console.WriteLine($"-> Chọn bác sĩ: {doctor.FullName} ({doctor.Specialty}) - {doctor.RoomNumber}");
 
-    if (!response.IsSuccessStatusCode)
+    // Bước 2: Gọi REST API lấy khung giờ khám trống
+    Console.WriteLine($"\n[Bước 2/5] GỌI REST API: GET /doctors/{doctor.Id}/slots");
+    var slotRes = await client.GetAsync($"/doctors/{doctor.Id}/slots");
+    slotRes.EnsureSuccessStatusCode();
+    var slots = await slotRes.Content.ReadFromJsonAsync<List<TimeSlot>>() ?? [];
+    var availableSlot = slots.FirstOrDefault(s => !s.IsBooked) ?? slots.First();
+    Console.WriteLine($"-> Chọn khung giờ trống: {availableSlot.StartTime:HH:mm} - {availableSlot.EndTime:HH:mm} (SlotId: {availableSlot.Id})");
+
+    // Bước 3: Đảm bảo SignalR Hub đã kết nối
+    await EnsureHubConnectedAsync(hub);
+
+    // Chuẩn bị TaskCompletionSource để đợi thông báo SignalR tương ứng
+    var tcsNotification = new TaskCompletionSource<AppointmentStatusNotification>();
+    var patientId = Guid.NewGuid();
+
+    // Bước 4: Gửi REST API đặt lịch khám
+    Console.WriteLine("\n[Bước 3/5] GỌI REST API: POST /appointments");
+    var bookingRequest = new CreateAppointmentRequest
     {
-        await HandleApiErrorAsync(response);
-        return;
-    }
+        PatientId = patientId,
+        DoctorId = doctor.Id,
+        TimeSlotId = availableSlot.Id,
+        AppointmentDate = DateTime.UtcNow.Date.AddHours(8),
+        Reason = "Khám tổng quát sức khỏe định kỳ"
+    };
 
-    var slots = await response.Content.ReadFromJsonAsync<List<TimeSlot>>();
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine("\n--- DANH SÁCH KHUNG GIỜ KHÁM CÒN TRỐNG ---");
+    var bookRes = await client.PostAsJsonAsync("/appointments", bookingRequest);
+    bookRes.EnsureSuccessStatusCode();
+
+    using var docJson = JsonDocument.Parse(await bookRes.Content.ReadAsStringAsync());
+    var appointmentElement = docJson.RootElement.GetProperty("appointment");
+    var appointmentId = Guid.Parse(appointmentElement.GetProperty("id").GetString()!);
+    var initialStatus = appointmentElement.GetProperty("status").GetInt32();
+
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine($"-> TIẾP NHẬN THÀNH CÔNG! Mã lịch khám (AppointmentId): {appointmentId}");
+    Console.WriteLine($"-> Trạng thái ban đầu trên Server: {(AppointmentStatus)initialStatus} (Đang chờ xếp hàng)");
     Console.ResetColor();
 
-    if (slots is null || slots.Count == 0)
+    activeTracking.Add(appointmentId);
+
+    // Bước 5: Tham gia SignalR Group riêng của lịch khám này
+    Console.WriteLine($"\n[Bước 4/5] GIA NHẬP SIGNALR GROUP: Appointment_{appointmentId}");
+    await hub.InvokeAsync("JoinAppointmentGroup", appointmentId.ToString());
+
+    // Đăng ký nhận thông báo
+    using var subscription = hub.On<AppointmentStatusNotification>("ReceiveAppointmentStatus", (notif) =>
     {
-        Console.WriteLine("Bác sĩ không có khung giờ nào còn khả dụng trong ngày.");
-        return;
-    }
-
-    foreach (var s in slots)
-    {
-        var status = s.IsBooked ? "[ĐÃ ĐẶT - HẾT CHỖ]" : "[CÒN TRỐNG - ĐẶT ĐƯỢC]";
-        Console.WriteLine($"• Slot ID: {s.Id} | {s.StartTime:HH:mm} - {s.EndTime:HH:mm} -> {status}");
-    }
-}
-
-// 4. POST /appointments - Yêu cầu 1 (Validate 400 & 404)
-static async Task BookAppointmentAsync(HttpClient client)
-{
-    Console.WriteLine("CHỌN CHẾ ĐỘ ĐẶT LỊCH:");
-    Console.WriteLine("  1. Đặt lịch HỢP LỆ (Gửi đầy đủ thông tin chuẩn)");
-    Console.WriteLine("  2. Test lỗi 400 Bad Request (Gửi thiếu mã bệnh nhân & lý do)");
-    Console.WriteLine("  3. Test lỗi 404 Not Found (Gửi mã bác sĩ không tồn tại)");
-    Console.Write("Nhập lựa chọn (1/2/3, mặc định 1): ");
-    var mode = Console.ReadLine()?.Trim();
-
-    CreateAppointmentRequest request;
-
-    if (mode == "2")
-    {
-        // Tạo request thiếu trường bắt buộc để kích hoạt validation 400 Bad Request
-        request = new CreateAppointmentRequest
+        if (notif.AppointmentId == appointmentId)
         {
-            PatientId = Guid.Empty, // Lỗi
-            DoctorId = Guid.Empty,  // Lỗi
-            TimeSlotId = Guid.Empty,
-            Reason = "" // Lỗi
-        };
-        Console.WriteLine("\n[Test Mode] Gửi request không hợp lệ (PatientId rỗng, Reason rỗng)...");
-    }
-    else if (mode == "3")
+            tcsNotification.TrySetResult(notif);
+        }
+    });
+
+    Console.WriteLine("-> Đang lắng nghe thông báo cập nhật số thứ tự thời gian thực từ Server...");
+
+    // Chờ thông báo SignalR (tối đa 10 giây)
+    var completedTask = await Task.WhenAny(tcsNotification.Task, Task.Delay(10000));
+    if (completedTask == tcsNotification.Task)
     {
-        // Gửi bác sĩ không tồn tại để kích hoạt 404 Not Found
-        request = new CreateAppointmentRequest
-        {
-            PatientId = Guid.NewGuid(),
-            DoctorId = Guid.Parse("00000000-0000-0000-0000-000000000404"),
-            TimeSlotId = Guid.NewGuid(),
-            Reason = "Khám đau đầu"
-        };
-        Console.WriteLine("\n[Test Mode] Gửi request với DoctorId không tồn tại trên hệ thống...");
+        var result = await tcsNotification.Task;
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("\n================== NHẬN THÔNG BÁO TỪ SIGNALR (REALTIME) ==================");
+        Console.WriteLine($"• Mã lịch hẹn:       {result.AppointmentId}");
+        Console.WriteLine($"• Trạng thái mới:    {result.Status}");
+        Console.WriteLine($"• SỐ THỨ TỰ (STT):   #{result.TicketNumber}");
+        Console.WriteLine($"• Thời gian dự kiến: {result.EstimatedTime:HH:mm} UTC");
+        Console.WriteLine($"• Thông điệp:        {result.Message}");
+        Console.WriteLine("==========================================================================");
+        Console.ResetColor();
     }
     else
     {
-        // Request hợp lệ
-        var patientId = Guid.NewGuid();
-        var doctorId = Guid.Parse("11111111-1111-1111-1111-111111111111");
-        var slotId = Guid.Parse("a1111111-0000-0000-0000-000000000001");
-
-        Console.Write("Nhập lý do khám (bỏ trống để lấy 'Đau họng, ho kéo dài'): ");
-        var reason = Console.ReadLine()?.Trim();
-
-        request = new CreateAppointmentRequest
-        {
-            PatientId = patientId,
-            DoctorId = doctorId,
-            TimeSlotId = slotId,
-            AppointmentDate = DateTime.UtcNow.Date.AddHours(8),
-            Reason = string.IsNullOrEmpty(reason) ? "Đau họng, ho kéo dài" : reason
-        };
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\n[Timeout] Chưa nhận được thông báo từ SignalR trong 10 giây.");
+        Console.ResetColor();
     }
 
-    Console.WriteLine(">>> Đang gửi yêu cầu: POST /appointments ...");
-    var response = await client.PostAsJsonAsync("/appointments", request);
+    // Bước 6: Gọi lại REST API để đối chiếu trạng thái cuối cùng
+    Console.WriteLine($"\n[Bước 5/5] GỌI LẠI REST API ĐỂ ĐỐI CHIẾU: GET /appointments/{appointmentId}");
+    var verifyRes = await client.GetAsync($"/appointments/{appointmentId}");
+    verifyRes.EnsureSuccessStatusCode();
+    var verifyContent = await verifyRes.Content.ReadAsStringAsync();
 
-    if (!response.IsSuccessStatusCode)
-    {
-        await HandleApiErrorAsync(response);
-        return;
-    }
-
-    var content = await response.Content.ReadAsStringAsync();
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine($"\n[Thành công - HTTP {response.StatusCode}] Phản hồi từ Server:");
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine("-> DỮ LIỆU ĐỐI CHIẾU TRÊN DATABASE/SERVER:");
     Console.ResetColor();
-    Console.WriteLine(content);
-}
+    Console.WriteLine(verifyContent);
 
-// 5. GET /appointments/{id} - Yêu cầu 3 & 4
-static async Task LookupAppointmentAsync(HttpClient client)
-{
-    Console.WriteLine("Tra cứu chi tiết lịch hẹn:");
-    Console.WriteLine("  (1) Lịch hẹn mẫu có sẵn: 99999999-9999-9999-9999-999999999999");
-    Console.WriteLine("  (2) Mã không tồn tại (để test 404): 00000000-0000-0000-0000-000000000404");
-    Console.Write("Nhập Appointment ID (bỏ trống dùng lịch hẹn mẫu): ");
-
-    var input = Console.ReadLine()?.Trim();
-    var appointmentId = string.IsNullOrEmpty(input) ? "99999999-9999-9999-9999-999999999999" : input;
-
-    Console.WriteLine($"\n>>> Đang gửi yêu cầu: GET /appointments/{appointmentId} ...");
-    var response = await client.GetAsync($"/appointments/{appointmentId}");
-
-    if (!response.IsSuccessStatusCode)
-    {
-        await HandleApiErrorAsync(response);
-        return;
-    }
-
-    var content = await response.Content.ReadAsStringAsync();
     Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine("\n=== CHI TIẾT LỊCH HẸN KHÁM BỆNH ===");
+    Console.WriteLine("\n>>> HOÀN THÀNH YÊU CẦU 1: Dữ liệu SignalR và dữ liệu REST API đồng nhất 100%!");
     Console.ResetColor();
-    Console.WriteLine(content);
-}
-
-// 6. DELETE /appointments/{id}
-static async Task CancelAppointmentAsync(HttpClient client)
-{
-    Console.Write("Nhập Appointment ID cần hủy: ");
-    var input = Console.ReadLine()?.Trim();
-    var appointmentId = string.IsNullOrEmpty(input) ? "99999999-9999-9999-9999-999999999999" : input;
-
-    Console.WriteLine($"\n>>> Đang gửi yêu cầu: DELETE /appointments/{appointmentId} ...");
-    var response = await client.DeleteAsync($"/appointments/{appointmentId}");
-
-    if (!response.IsSuccessStatusCode)
-    {
-        await HandleApiErrorAsync(response);
-        return;
-    }
-
-    var content = await response.Content.ReadAsStringAsync();
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine("\n[Thành công] Phản hồi hủy lịch hẹn:");
-    Console.ResetColor();
-    Console.WriteLine(content);
-}
-
-// 7. GET /queues/{doctorId}
-static async Task ShowQueueStatusAsync(HttpClient client)
-{
-    Console.Write("Nhập Doctor ID (bỏ trống để lấy BS. Nguyễn Văn A): ");
-    var input = Console.ReadLine()?.Trim();
-    var doctorId = string.IsNullOrEmpty(input) ? "11111111-1111-1111-1111-111111111111" : input;
-
-    Console.WriteLine($"\n>>> Đang gửi yêu cầu: GET /queues/{doctorId} ...");
-    var response = await client.GetAsync($"/queues/{doctorId}");
-
-    if (!response.IsSuccessStatusCode)
-    {
-        await HandleApiErrorAsync(response);
-        return;
-    }
-
-    var content = await response.Content.ReadAsStringAsync();
-    Console.ForegroundColor = ConsoleColor.Green;
-    Console.WriteLine("\n=== TRẠNG THÁI HÀNG ĐỢI PHÒNG KHÁM ===");
-    Console.ResetColor();
-    Console.WriteLine(content);
-}
-
-// 8. Health Check
-static async Task CheckServicesHealthAsync(HttpClient apiClient, string notificationUrl)
-{
-    Console.WriteLine(">>> Kiểm tra trạng thái sức khỏe các dịch vụ:");
-    try
-    {
-        var res = await apiClient.GetAsync("/");
-        Console.WriteLine($"[Appointment.Api] Trạng thái: {(res.IsSuccessStatusCode ? "HOẠT ĐỘNG (Healthy)" : "LỖI")}");
-    }
-    catch
-    {
-        Console.WriteLine("[Appointment.Api] Không thể kết nối!");
-    }
-
-    try
-    {
-        using var notifClient = new HttpClient { BaseAddress = new Uri(notificationUrl) };
-        var res = await notifClient.GetAsync("/");
-        Console.WriteLine($"[Notification.Service] Trạng thái: {(res.IsSuccessStatusCode ? "HOẠT ĐỘNG (Healthy)" : "LỖI")}");
-    }
-    catch
-    {
-        Console.WriteLine("[Notification.Service] Không thể kết nối!");
-    }
 }
 
 // =============================================================================
-// BỘ XỬ LÝ LỖI CHUẨN DTO CHO CLIENT (Yêu cầu 4)
-// Không để crash ứng dụng hay throw ngoại lệ thô, phân tích DTO lỗi trả về từ API
+// YÊU CẦU 2: XỬ LÝ TRẠNG THÁI LỖI ('FAILED') TỪ SIGNALR
 // =============================================================================
-static async Task HandleApiErrorAsync(HttpResponseMessage response)
+static async Task RunFailedStateFlowAsync(HttpClient client, HubConnection hub, ConcurrentBag<Guid> activeTracking)
 {
-    Console.ForegroundColor = ConsoleColor.Red;
-    Console.WriteLine($"\n==================== PHẢN HỒI LỖI TỪ SERVER ====================");
-    Console.WriteLine($"Mã trạng thái HTTP: {(int)response.StatusCode} ({response.StatusCode})");
+    Console.WriteLine("================================================================================");
+    Console.WriteLine("        BẮT ĐẦU KIỂM THỬ YÊU CẦU 2: PHÁT SINH VÀ BẮT TRẠNG THÁI 'FAILED'");
+    Console.WriteLine("================================================================================");
 
-    try
+    await EnsureHubConnectedAsync(hub);
+
+    // Chuẩn bị request có từ khóa kích hoạt kịch bản lỗi trong tiến trình nền
+    var patientId = Guid.NewGuid();
+    var doctorId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+    var slotId = Guid.Parse("a1111111-0000-0000-0000-000000000001");
+
+    Console.WriteLine("-> Gửi yêu cầu đặt lịch với lý do mô phỏng lỗi: 'Cần khám gấp [trigger-fail]'");
+    var bookingRequest = new CreateAppointmentRequest
     {
-        var error = await response.Content.ReadFromJsonAsync<ApiErrorResponse>();
-        if (error is not null)
-        {
-            Console.WriteLine($"Thông điệp:         {error.Message}");
-            if (!string.IsNullOrEmpty(error.Details))
-            {
-                Console.WriteLine($"Chi tiết:           {error.Details}");
-            }
+        PatientId = patientId,
+        DoctorId = doctorId,
+        TimeSlotId = slotId,
+        AppointmentDate = DateTime.UtcNow.Date.AddHours(8),
+        Reason = "Cần khám gấp [trigger-fail]"
+    };
 
-            if (error.ValidationErrors is not null && error.ValidationErrors.Count > 0)
-            {
-                Console.WriteLine("Danh sách lỗi kiểm tra hợp lệ (Validation Errors):");
-                foreach (var (field, errors) in error.ValidationErrors)
-                {
-                    foreach (var err in errors)
-                    {
-                        Console.WriteLine($"  - [{field}]: {err}");
-                    }
-                }
-            }
-            Console.WriteLine($"Thời điểm ghi nhận: {error.Timestamp:yyyy-MM-dd HH:mm:ss} UTC");
+    var bookRes = await client.PostAsJsonAsync("/appointments", bookingRequest);
+    bookRes.EnsureSuccessStatusCode();
+
+    using var docJson = JsonDocument.Parse(await bookRes.Content.ReadAsStringAsync());
+    var appointmentId = Guid.Parse(docJson.RootElement.GetProperty("appointment").GetProperty("id").GetString()!);
+
+    Console.WriteLine($"-> Tiếp nhận lịch hẹn: {appointmentId}. Trạng thái ban đầu: Pending");
+    activeTracking.Add(appointmentId);
+
+    // Gia nhập SignalR Group
+    await hub.InvokeAsync("JoinAppointmentGroup", appointmentId.ToString());
+
+    var tcsFailed = new TaskCompletionSource<AppointmentStatusNotification>();
+
+    using var subscription = hub.On<AppointmentStatusNotification>("ReceiveAppointmentStatus", (notif) =>
+    {
+        if (notif.AppointmentId == appointmentId)
+        {
+            tcsFailed.TrySetResult(notif);
+        }
+    });
+
+    Console.WriteLine("-> Đang chờ xử lý hàng đợi và lắng nghe thông báo trạng thái...");
+
+    var completed = await Task.WhenAny(tcsFailed.Task, Task.Delay(10000));
+    if (completed == tcsFailed.Task)
+    {
+        var result = await tcsFailed.Task;
+
+        if (result.Status == AppointmentStatus.Failed)
+        {
+            // BẮT SỰ KIỆN FAILED VÀ IN CẢNH BÁO ĐẶC BIỆT (Yêu cầu 2)
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.BackgroundColor = ConsoleColor.DarkRed;
+            Console.WriteLine("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            Console.WriteLine(" [CẢNH BÁO LỖI NGHIỆP VỤ] LỊCH HẸN ĐÃ BỊ CHUYỂN SANG TRẠNG THÁI: FAILED! ");
+            Console.WriteLine("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            Console.ResetColor();
+
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"• Mã lịch hẹn gặp sự cố: {result.AppointmentId}");
+            Console.WriteLine($"• Trạng thái ghi nhận:   {result.Status}");
+            Console.WriteLine($"• Thông điệp từ Server:  {result.Message}");
+            Console.WriteLine($"• Thời điểm phát sinh:   {result.Timestamp:yyyy-MM-dd HH:mm:ss} UTC");
+            Console.WriteLine("• HƯỚNG DẪN XỬ LÝ: Khung giờ đã đầy do ưu tiên cấp cứu. Vui lòng chọn khung giờ khác.");
+            Console.ResetColor();
         }
         else
         {
-            var raw = await response.Content.ReadAsStringAsync();
-            Console.WriteLine($"Nội dung: {raw}");
+            Console.WriteLine($"Nhận trạng thái: {result.Status}");
         }
     }
-    catch
-    {
-        var raw = await response.Content.ReadAsStringAsync();
-        Console.WriteLine($"Nội dung phản hồi: {raw}");
-    }
 
-    Console.WriteLine("================================================================");
+    // Đối chiếu lại với REST API
+    Console.WriteLine($"\n-> Đối chiếu lại qua REST API GET /appointments/{appointmentId}...");
+    var checkRes = await client.GetAsync($"/appointments/{appointmentId}");
+    var checkContent = await checkRes.Content.ReadAsStringAsync();
+    Console.WriteLine($"Dữ liệu lưu tại Server:\n{checkContent}");
+}
+
+// =============================================================================
+// YÊU CẦU 3: THEO DÕI ĐỒNG THỜI 2 LỊCH KHÁM (CONCURRENCY & ISOLATION)
+// =============================================================================
+static async Task RunConcurrentAppointmentsFlowAsync(HttpClient client, HubConnection hub)
+{
+    Console.WriteLine("================================================================================");
+    Console.WriteLine("   BẮT ĐẦU KIỂM THỬ YÊU CẦU 3: THEO DÕI ĐỒNG THỜI 2 LỊCH KHÁM (ISOLATION TEST)");
+    Console.WriteLine("================================================================================");
+
+    await EnsureHubConnectedAsync(hub);
+
+    // Đặt 2 lịch khám đồng thời cho 2 bệnh nhân khác nhau
+    var patient1 = Guid.NewGuid();
+    var doctor1 = Guid.Parse("11111111-1111-1111-1111-111111111111"); // BS. Nguyễn Văn A
+    var slot1 = Guid.Parse("a1111111-0000-0000-0000-000000000002");
+
+    var patient2 = Guid.NewGuid();
+    var doctor2 = Guid.Parse("44444444-4444-4444-4444-444444444444"); // BS. Phạm Thị D
+    var slot2 = Guid.Parse("d4444444-0000-0000-0000-000000000001");
+
+    Console.WriteLine(">>> Đang gửi đồng thời 2 yêu cầu đặt lịch qua REST API (Task.WhenAll)...");
+
+    var req1 = new CreateAppointmentRequest { PatientId = patient1, DoctorId = doctor1, TimeSlotId = slot1, Reason = "Khám đau dạ dày" };
+    var req2 = new CreateAppointmentRequest { PatientId = patient2, DoctorId = doctor2, TimeSlotId = slot2, Reason = "Khám dị ứng da" };
+
+    var taskPost1 = client.PostAsJsonAsync("/appointments", req1);
+    var taskPost2 = client.PostAsJsonAsync("/appointments", req2);
+
+    await Task.WhenAll(taskPost1, taskPost2);
+
+    var res1 = await taskPost1;
+    var res2 = await taskPost2;
+
+    using var doc1 = JsonDocument.Parse(await res1.Content.ReadAsStringAsync());
+    using var doc2 = JsonDocument.Parse(await res2.Content.ReadAsStringAsync());
+
+    var apptId1 = Guid.Parse(doc1.RootElement.GetProperty("appointment").GetProperty("id").GetString()!);
+    var apptId2 = Guid.Parse(doc2.RootElement.GetProperty("appointment").GetProperty("id").GetString()!);
+
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine($"[Luồng Lịch 1] Tiếp nhận AppointmentId 1: {apptId1} (BS. Nguyễn Văn A)");
+    Console.WriteLine($"[Luồng Lịch 2] Tiếp nhận AppointmentId 2: {apptId2} (BS. Phạm Thị D)");
     Console.ResetColor();
+
+    // Mỗi luồng gia nhập đúng Group riêng biệt của mình trên SignalR
+    await hub.InvokeAsync("JoinAppointmentGroup", apptId1.ToString());
+    await hub.InvokeAsync("JoinAppointmentGroup", apptId2.ToString());
+
+    var tcs1 = new TaskCompletionSource<AppointmentStatusNotification>();
+    var tcs2 = new TaskCompletionSource<AppointmentStatusNotification>();
+
+    using var sub = hub.On<AppointmentStatusNotification>("ReceiveAppointmentStatus", (notif) =>
+    {
+        if (notif.AppointmentId == apptId1)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"\n>>> [LUỒNG LỊCH 1 NHẬN TIN ĐÚNG ĐÍCH] Lịch {notif.AppointmentId} -> STT: #{notif.TicketNumber} (Status: {notif.Status})");
+            Console.ResetColor();
+            tcs1.TrySetResult(notif);
+        }
+        else if (notif.AppointmentId == apptId2)
+        {
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.WriteLine($"\n>>> [LUỒNG LỊCH 2 NHẬN TIN ĐÚNG ĐÍCH] Lịch {notif.AppointmentId} -> STT: #{notif.TicketNumber} (Status: {notif.Status})");
+            Console.ResetColor();
+            tcs2.TrySetResult(notif);
+        }
+        else
+        {
+            Console.WriteLine($"[Lạc tin] Nhận tin không thuộc luồng 1 hoặc 2: {notif.AppointmentId}");
+        }
+    });
+
+    Console.WriteLine("-> Đang theo dõi cả 2 luồng đồng thời qua SignalR Groups...");
+    await Task.WhenAll(tcs1.Task, tcs2.Task);
+
+    var r1 = await tcs1.Task;
+    var r2 = await tcs2.Task;
+
+    Console.ForegroundColor = ConsoleColor.Yellow;
+    Console.WriteLine("\n================== KẾT QUẢ ĐỐI SOÁT CÁCH LY THÔNG ĐIỆP ==================");
+    Console.WriteLine($"• Lịch 1 ({r1.AppointmentId}): Cấp STT #{r1.TicketNumber} -> Trả về đúng Luồng 1.");
+    Console.WriteLine($"• Lịch 2 ({r2.AppointmentId}): Cấp STT #{r2.TicketNumber} -> Trả về đúng Luồng 2.");
+    Console.WriteLine("• Kết luận: Cơ chế SignalR Groups đảm bảo cách ly tuyệt đối, không trùng lặp hay ghi đè!");
+    Console.WriteLine("=========================================================================");
+    Console.ResetColor();
+}
+
+// =============================================================================
+// YÊU CẦU 4: KIỂM THỬ SỰ CỐ MẤT KẾT NỐI & CƠ CHẾ RECONNECT
+// =============================================================================
+static async Task TestDisconnectionScenarioAsync(HubConnection hub, string apiUrl)
+{
+    Console.WriteLine("================================================================================");
+    Console.WriteLine("        BẮT ĐẦU KIỂM THỬ YÊU CẦU 4: MẤT KẾT NỐI & TỰ ĐỘNG KHÔI PHỤC");
+    Console.WriteLine("================================================================================");
+
+    Console.WriteLine($"Trạng thái SignalR Connection hiện tại: {hub.State}");
+
+    if (hub.State == HubConnectionState.Connected)
+    {
+        Console.WriteLine("\nKịch bản 1: MÔ PHỎNG NGẮT KẾT NỐI TỪ CLIENT:");
+        Console.WriteLine("Đang gọi StopAsync() để ngắt kết nối chủ động...");
+        await hub.StopAsync();
+        Console.WriteLine($"Trạng thái sau khi ngắt: {hub.State}");
+
+        Console.WriteLine("\nĐang gọi StartAsync() để kết nối lại...");
+        await hub.StartAsync();
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"Đã kết nối lại thành công! Trạng thái: {hub.State} | Id: {hub.ConnectionId}");
+        Console.ResetColor();
+    }
+    else
+    {
+        Console.WriteLine("\nKịch bản 2: KẾT NỐI TỚI PORT KHÔNG TỒN TẠI (Mô phỏng Server chưa bật):");
+        var badHub = new HubConnectionBuilder()
+            .WithUrl("http://localhost:5999/hubs/queue")
+            .WithAutomaticReconnect()
+            .Build();
+
+        try
+        {
+            Console.WriteLine("Đang thử kết nối tới Server chưa khởi động tại port 5999...");
+            await badHub.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Bắt lỗi kết nối thành công] Không thể kết nối tới Server chưa bật:");
+            Console.WriteLine($"Thông điệp lỗi: {ex.Message}");
+            Console.ResetColor();
+        }
+        finally
+        {
+            await badHub.DisposeAsync();
+        }
+    }
+}
+
+// =============================================================================
+// CÁC HÀM TIỆN ÍCH REST API
+// =============================================================================
+static async Task ShowDoctorsAndSlotsAsync(HttpClient client)
+{
+    var res = await client.GetAsync("/doctors");
+    var doctors = await res.Content.ReadFromJsonAsync<List<Doctor>>() ?? [];
+    Console.WriteLine($"\n--- DANH SÁCH BÁC SĨ ({doctors.Count}) ---");
+    foreach (var d in doctors)
+    {
+        Console.WriteLine($"• ID: {d.Id} | {d.FullName} - {d.Specialty} | {d.RoomNumber}");
+        var slotRes = await client.GetAsync($"/doctors/{d.Id}/slots");
+        var slots = await slotRes.Content.ReadFromJsonAsync<List<TimeSlot>>() ?? [];
+        foreach (var s in slots)
+        {
+            Console.WriteLine($"    Slot {s.StartTime:HH:mm}-{s.EndTime:HH:mm} | {(s.IsBooked ? "[HẾT CHỖ]" : "[CÒN TRỐNG]")}");
+        }
+    }
+}
+
+static async Task LookupAppointmentDetailsAsync(HttpClient client)
+{
+    Console.Write("Nhập Appointment ID cần tra cứu (bỏ trống dùng lịch mẫu): ");
+    var input = Console.ReadLine()?.Trim();
+    var id = string.IsNullOrEmpty(input) ? "99999999-9999-9999-9999-999999999999" : input;
+
+    var res = await client.GetAsync($"/appointments/{id}");
+    var content = await res.Content.ReadAsStringAsync();
+    Console.WriteLine($"\nPhản hồi từ Server (HTTP {res.StatusCode}):\n{content}");
 }

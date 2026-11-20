@@ -28,6 +28,10 @@ public enum AppointmentStatus
     /// <summary>
     /// Đã bị hủy bỏ bởi bệnh nhân hoặc phòng khám.
     /// </summary>
-    Cancelled = 4
-}
+    Cancelled = 4,
 
+    /// <summary>
+    /// Xử lý thất bại (khung giờ đầy đột xuất, sự cố bác sĩ hoặc lỗi xếp hàng).
+    /// </summary>
+    Failed = 5
+}
